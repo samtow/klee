@@ -568,15 +568,18 @@ fi
 echo "--- Processes outliving the main command die with klee ---"
 marker=$(( 600000 + $$ % 100000 ))
 tag="klee-survivor-$$"
-$KLEE --bind / / -- /bin/sh -c "sh -c 'sleep $marker & exit 0'; sh -c 'while :; do sleep 0.02; done' $tag & sleep 0.5" >/dev/null 2>&1 || true
+# The stat() loops keep tracees parked at seccomp stops, where the old
+# detach dropped its SIGKILL.
+$KLEE --bind / / -- /bin/sh -c "for i in 1 2 3 4; do sh -c 'while :; do [ -e / ]; done' $tag & done; sh -c 'sleep $marker & exit 0'; sleep 0.5" >/dev/null 2>&1 || true
 sleep 1
-left=$(ps -eo args | grep -cE "^(/usr/bin/)?sleep $marker\$|$tag" || true)
+# [k] keeps the grep from matching its own command line.
+left=$(ps -eo args | grep -cE "^(/usr/bin/)?sleep $marker\$|[k]lee-survivor-$$\$" || true)
 if [ "$left" = "0" ]; then
     pass "no processes survive klee"
 else
     fail "$left process(es) survived klee"
-    pkill -f "sleep $marker" 2>/dev/null || true
-    pkill -f "$tag" 2>/dev/null || true
+    pkill -f "^(/usr/bin/)?sleep $marker\$" 2>/dev/null || true
+    pkill -f "[k]lee-survivor-$$\$" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
