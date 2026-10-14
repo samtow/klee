@@ -12,11 +12,9 @@
 #include "fuse/fuse_proc.h"
 #include "util/log.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
-#include <time.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/epoll.h>
@@ -437,97 +435,6 @@ int klee_event_loop_handle(KleeEventLoop *el, KleeEvent *event)
     return 0;
 }
 
-static bool deadline_passed(const struct timespec *deadline)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return now.tv_sec > deadline->tv_sec ||
-           (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec);
-}
-
-/* True if klee is still pid's tracer.  Guards the SIGKILLs below against a
- * stale table entry whose PID now belongs to an unrelated process, which
- * matters when klee runs as root. */
-static bool traced_by_us(pid_t pid)
-{
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%d/status", pid);
-    FILE *f = fopen(path, "re");
-    if (!f)
-        return false;
-    pid_t tracer = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), f)) {
-        if (sscanf(line, "TracerPid: %d", &tracer) == 1)
-            break;
-    }
-    fclose(f);
-    return tracer == getpid();
-}
-
-/* Terminate tracees that outlived the sandbox's main process (daemons like
- * gpg-agent, orphans), the way a PID namespace dies with its init.
- *
- * kill(2) is used instead of a PTRACE_DETACH signal: SIGKILL wakes a tracee
- * in any ptrace-stop, whereas a detach signal is dropped at event-stops
- * (seccomp, fork, exec) and DETACH fails on running tracees.  A detached
- * survivor keeps klee's SECCOMP_RET_TRACE filter and gets ENOSYS from every
- * trapped syscall (open, connect, wait4, ...) once klee is gone. */
-static void kill_remaining_tracees(KleeEventLoop *el)
-{
-    KleeProcessTable *pt = el->proctable;
-    if (pt->count == 0)
-        return;
-
-    KLEE_DEBUG("killing %zu remaining processes", pt->count);
-    bool ptraced = el->interceptor->backend == INTERCEPT_PTRACE;
-    for (size_t i = 0; i < pt->by_pid->capacity; i++) {
-        KleeHTEntry *ent = &pt->by_pid->entries[i];
-        if (!ent->occupied || ent->deleted)
-            continue;
-        pid_t pid = (pid_t)ent->key;
-        if (pid > 0 && (!ptraced || traced_by_us(pid)))
-            kill(pid, SIGKILL);
-    }
-
-    if (!ptraced) {
-        while (waitpid(-1, NULL, WNOHANG) > 0)
-            ;
-        return;
-    }
-
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += 2;
-
-    while (pt->count > 0) {
-        int status;
-        pid_t pid = waitpid(-1, &status, __WALL | WNOHANG);
-        if (pid < 0) {
-            if (errno == EINTR)
-                continue;
-            break; /* ECHILD: no tracees left */
-        }
-        if (pid == 0) {
-            if (deadline_passed(&deadline))
-                break; /* PTRACE_O_EXITKILL covers anything left */
-            struct timespec pause = { 0, 1000000 };
-            nanosleep(&pause, NULL);
-            continue;
-        }
-        if (WIFSTOPPED(status)) {
-            /* A stop already in flight (PTRACE_EVENT_EXIT, or a new child
-             * klee never saw): make sure it dies, then let it run. */
-            kill(pid, SIGKILL);
-            ptrace(PTRACE_CONT, pid, 0, 0);
-            continue;
-        }
-        if (el->sandbox && el->sandbox->pid_map)
-            klee_pid_map_remove(el->sandbox->pid_map, pid);
-        klee_process_remove(pt, pid);
-    }
-}
-
 int klee_event_loop_run(KleeEventLoop *el)
 {
     KLEE_INFO("entering event loop");
@@ -598,7 +505,21 @@ int klee_event_loop_run(KleeEventLoop *el)
         }
     }
 
-    kill_remaining_tracees(el);
+    /* Tracees that outlived the sandbox's main process (daemons like
+     * gpg-agent, orphans) are deliberately left attached: every tracee
+     * inherits PTRACE_O_EXITKILL, so the kernel SIGKILLs all of them when
+     * klee exits, the way a PID namespace dies with its init.
+     *
+     * They used to be PTRACE_DETACHed with SIGKILL as the restart signal,
+     * but that signal is dropped at event-stops (seccomp, fork, exec) and
+     * DETACH fails on running tracees.  The survivors lost EXITKILL, kept
+     * klee's SECCOMP_RET_TRACE filter and got ENOSYS from every trapped
+     * syscall (open, connect, wait4, ...) once klee was gone. */
+    if (el->proctable->count > 0)
+        KLEE_DEBUG("%zu traced processes remain; they die with klee",
+                   el->proctable->count);
+    while (waitpid(-1, NULL, WNOHANG) > 0)
+        ;
 
     KLEE_INFO("event loop exited with status %d", el->exit_status);
     return el->exit_status;
